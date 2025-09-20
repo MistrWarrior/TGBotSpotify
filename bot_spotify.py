@@ -1,306 +1,283 @@
-# bot_spotify.py
-# Telegram → Spotify playlist bot
-# Requiere variables de entorno:
-# TELEGRAM_BOT_TOKEN, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
-# SPOTIFY_REFRESH_TOKEN, SPOTIFY_PLAYLIST_ID, SPOTIFY_MARKET (ej: MX)
-
-import os
-import re
-import time
-import logging
-import requests
+import os, re, json, logging, unicodedata
+from difflib import SequenceMatcher
 from urllib.parse import urlparse
-
+import requests
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("spotify-telegram-bot")
 
-# ====== ENV ======
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
-CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
-REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "").strip()
-SPOTIFY_PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID", "").strip()
-MARKET = os.getenv("SPOTIFY_MARKET", "MX").strip() or "MX"
+# === ENV ===
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN")
+PLAYLIST_ID = os.getenv("SPOTIFY_PLAYLIST_ID")
+MARKET = os.getenv("SPOTIFY_MARKET", "MX")
 
-# ====== SPOTIFY AUTH ======
-_SPOTIFY_TOKEN_CACHE = {"access": None, "exp": 0}
+# === Helpers de normalización y similitud ===
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
+def normalize(s: str) -> str:
+    s = strip_accents(s.lower())
+    s = re.sub(r'[^a-z0-9\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def sim(a: str, b: str) -> float:
+    a_n, b_n = normalize(a), normalize(b)
+    if not a_n or not b_n:
+        return 0.0
+    # un pequeño boost si uno contiene al otro
+    contain_boost = 0.1 if (a_n in b_n or b_n in a_n) else 0.0
+    return min(1.0, SequenceMatcher(None, a_n, b_n).ratio() + contain_boost)
+
+def fmt_track(t: dict) -> str:
+    name = t.get("name")
+    artists = ", ".join(a["name"] for a in t.get("artists", []))
+    return f"{name} — {artists}"
+
+def extract_track_id_from_url(text: str) -> str | None:
+    m = re.search(r'open\.spotify\.com/track/([A-Za-z0-9]+)', text)
+    if m: return m.group(1)
+    m = re.search(r'spotify:track:([A-Za-z0-9]+)', text)
+    if m: return m.group(1)
+    return None
+
+# === Spotify API básicas ===
 def get_access_token() -> str:
-    # Cache simple (55 mins)
-    if _SPOTIFY_TOKEN_CACHE["access"] and time.time() < _SPOTIFY_TOKEN_CACHE["exp"]:
-        return _SPOTIFY_TOKEN_CACHE["access"]
     r = requests.post(
         "https://accounts.spotify.com/api/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": REFRESH_TOKEN,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
+        data={"grant_type": "refresh_token", "refresh_token": REFRESH_TOKEN},
+        auth=(CLIENT_ID, CLIENT_SECRET),
         timeout=20,
     )
     r.raise_for_status()
-    data = r.json()
-    access = data["access_token"]
-    # spotify suele dar 3600s; dejamos margen
-    _SPOTIFY_TOKEN_CACHE["access"] = access
-    _SPOTIFY_TOKEN_CACHE["exp"] = time.time() + 3300
-    return access
+    return r.json()["access_token"]
 
-# ====== UTIL ======
-def extract_track_id_from_url(text: str) -> str | None:
-    """
-    Acepta:
-      - https://open.spotify.com/track/<id>
-      - spotify:track:<id>
-    """
-    text = text.strip()
-    if "open.spotify.com/track/" in text:
-        try:
-            path = urlparse(text).path
-            tid = path.split("/track/")[1].split("/")[0]
-            return tid
-        except Exception:
-            return None
-    m = re.match(r"spotify:track:([A-Za-z0-9]+)", text)
-    return m.group(1) if m else None
-
-_word_re = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+")
-
-def tokenize(s: str) -> list[str]:
-    return [w.lower() for w in _word_re.findall(s)]
-
-def score_match(query: str, title: str, artists: list[str]) -> float:
-    """
-    Scoring muy simple:
-      - tokens en común query↔title y query↔artists
-      - penaliza si title contiene 'live|remix|karaoke|version' y query no
-    """
-    q = set(tokenize(query))
-    t = set(tokenize(title))
-    a = set()
-    for x in artists:
-        a |= set(tokenize(x))
-
-    base = len(q & t) + 0.5 * len(q & a)
-
-    # si la query contiene palabas dentro de () inclúyelas
-    paren = re.findall(r"\(([^)]+)\)", query, flags=re.IGNORECASE)
-    for p in paren:
-        for tok in tokenize(p):
-            if tok in t or tok in a:
-                base += 0.25
-
-    flags = {"live", "remix", "karaoke", "version", "acoustic"}
-    q_has_flag = any(f in q for f in flags)
-    if not q_has_flag and any(f in t for f in flags):
-        base -= 0.75
-
-    # pequeña bonificación si primer artista aparece explícito en query
-    if tokenize(artists[0]) and (set(tokenize(artists[0])) & q):
-        base += 0.3
-
-    return base
-
-# ====== SPOTIFY OPS ======
-def search_track(q: str, market: str = "MX") -> dict | None:
-    """
-    Si recibe link/URI devuelve el track directo.
-    Si recibe texto, busca top 5 y escoge el mejor por score con umbral.
-    """
-    tid = extract_track_id_from_url(q)
+def search_tracks(q: str, market: str, limit: int = 10) -> list[dict]:
     access = get_access_token()
-
-    if tid:
-        r = requests.get(
-            f"https://api.spotify.com/v1/tracks/{tid}",
-            headers={"Authorization": f"Bearer {access}"},
-            params={"market": market},
-            timeout=20,
-        )
-        if r.status_code == 200:
-            return r.json()
-        r.raise_for_status()
-
     r = requests.get(
         "https://api.spotify.com/v1/search",
         headers={"Authorization": f"Bearer {access}"},
-        params={"q": q, "type": "track", "limit": 5, "market": market},
+        params={"q": q, "type": "track", "limit": limit, "market": market},
         timeout=20,
     )
     r.raise_for_status()
-    items = r.json().get("tracks", {}).get("items", [])
-    if not items:
-        return None
+    return r.json().get("tracks", {}).get("items", [])
 
-    # elegir por score y umbral mínimo para evitar falsos positivos
-    best = None
-    best_score = -1e9
-    for it in items:
-        title = it["name"]
-        artists = [a["name"] for a in it["artists"]]
-        s = score_match(q, title, artists)
-        if s > best_score:
-            best = it
-            best_score = s
-
-    # umbral: al menos 1 token relevante en común
-    if best and best_score >= 1.0:
-        return best
-    return None
-
-def track_in_playlist(track_id: str) -> bool:
+def get_playlist_items(limit: int = 100) -> list[dict]:
     access = get_access_token()
-    url = f"https://api.spotify.com/v1/playlists/{SPOTIFY_PLAYLIST_ID}/tracks"
-    params = {"market": MARKET, "fields": "items(track(id)),next", "limit": 100}
-    while True:
+    items = []
+    url = f"https://api.spotify.com/v1/playlists/{PLAYLIST_ID}/tracks"
+    params = {"limit": min(limit, 100), "market": MARKET}
+    while url and len(items) < limit:
         r = requests.get(url, headers={"Authorization": f"Bearer {access}"}, params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
         for it in data.get("items", []):
-            if it.get("track", {}).get("id") == track_id:
-                return True
-        if data.get("next"):
-            url = data["next"]
-            params = None  # next ya lleva querystring
-        else:
-            break
-    return False
+            if it.get("track"):
+                items.append(it["track"])
+        url = data.get("next")
+        params = None  # 'next' ya incluye query
+    return items
 
-def add_to_playlist(track_id: str):
+def add_track_to_playlist(track_id: str) -> None:
     access = get_access_token()
-    url = f"https://api.spotify.com/v1/playlists/{SPOTIFY_PLAYLIST_ID}/tracks"
-    r = requests.post(url, headers={"Authorization": f"Bearer {access}"}, json={"uris": [f"spotify:track:{track_id}"]}, timeout=20)
+    uri = f"spotify:track:{track_id}"
+    r = requests.post(
+        f"https://api.spotify.com/v1/playlists/{PLAYLIST_ID}/tracks",
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+        data=json.dumps({"uris": [uri]}),
+        timeout=20,
+    )
     r.raise_for_status()
-    return r.json()
 
-def remove_from_playlist(track_id: str):
+def remove_track_from_playlist_by_uri(uri: str) -> None:
     access = get_access_token()
-    url = f"https://api.spotify.com/v1/playlists/{SPOTIFY_PLAYLIST_ID}/tracks"
-    body = {"tracks": [{"uri": f"spotify:track:{track_id}"}]}
-    r = requests.delete(url, headers={"Authorization": f"Bearer {access}"}, json=body, timeout=20)
+    payload = {"tracks": [{"uri": uri}]}
+    r = requests.delete(
+        f"https://api.spotify.com/v1/playlists/{PLAYLIST_ID}/tracks",
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=20,
+    )
     r.raise_for_status()
-    return r.json()
 
-# ====== BOT TEXTOS ======
-HELP = (
-    "🤖 *Comandos disponibles:*\n\n"
-    "/ping - Verificar si el bot responde\n"
-    "/status - Revisar conexión con Spotify\n"
-    "/help - Mostrar esta ayuda\n"
-    "/remove <canción o link> - Eliminar canción de la playlist\n\n"
-    "👉 Para *agregar* una canción escribe el *título* (y opcional el artista),\n"
-    "   o pega un *link* de Spotify."
-)
+# === Lógica de selección flexible ===
+def best_search_candidate(query: str, market: str) -> dict | None:
+    results = search_tracks(query, market, limit=10)
+    if not results:
+        return None
+    Scored = []
+    for t in results:
+        title = t["name"]
+        artists = ", ".join(a["name"] for a in t["artists"])
+        label = f"{title} — {artists}"
+        Scored.append((sim(query, label), t))
+    Scored.sort(key=lambda x: x[0], reverse=True)
+    score, track = Scored[0]
+    # Aceptamos si la similitud es decente; si no, igual regresamos para decidir luego
+    return track
 
-# ====== HANDLERS ======
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP, parse_mode="Markdown")
+def find_in_playlist_by_id(track_id: str, playlist: list[dict]) -> dict | None:
+    for t in playlist:
+        if t.get("id") == track_id:
+            return t
+    return None
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong! (bot OK)")
+def best_playlist_match(query: str, playlist: list[dict]) -> tuple[dict | None, float]:
+    best_t, best_s = None, 0.0
+    qn = normalize(query)
+    for t in playlist:
+        label = fmt_track(t)
+        s = sim(qn, label)
+        if s > best_s:
+            best_s, best_t = s, t
+    return best_t, best_s
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === Telegram Handlers ===
+async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await cmd_help(update, _)
+
+async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🤖 *Comandos disponibles:*\n\n"
+        "/ping — Verificar si el bot responde\n"
+        "/status — Revisar acceso a Spotify y a la playlist\n"
+        "/help — Mostrar esta ayuda\n"
+        "/remove <texto|link> — Eliminar una canción de la playlist\n\n"
+        "👉 Para *agregar* una canción solo escribe su nombre.\n"
+        "   Ejemplo: _Morat Besos en Guerra_\n"
+    )
+    await update.message.reply_markdown(text)
+
+async def cmd_ping(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🏓 Pong!")
+
+async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE):
     try:
-        # Solo prueba el refresh y que se pueda leer la playlist
-        access = get_access_token()
-        r = requests.get(
-            f"https://api.spotify.com/v1/playlists/{SPOTIFY_PLAYLIST_ID}",
-            headers={"Authorization": f"Bearer {access}"},
-            params={"fields": "name,tracks.total"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        info = r.json()
-        await update.message.reply_text(f"✅ Conectado a Spotify\nPlaylist: *{info.get('name','?')}*\nTracks: {info.get('tracks',{}).get('total','?')}", parse_mode="Markdown")
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", "?")
-        await update.message.reply_text(f"⚠️ Error HTTP con Spotify: {code}")
+        _ = get_access_token()
+        pls = get_playlist_items(limit=1)
+        ok = "✅" if isinstance(pls, list) else "⚠️"
+        await update.message.reply_text(f"🧪 Spotify OK\nPlaylist ID: {PLAYLIST_ID}\nAcceso: ✅\nPlaylist: {ok}")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {e}")
+        log.exception("STATUS error")
+        await update.message.reply_text(f"❌ Error comprobando Spotify: {e}")
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = " ".join(context.args).strip()
-    if not q:
-        await update.message.reply_text("❌ Usa `/remove <nombre o link>`", parse_mode="Markdown")
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /remove <link|Título - Artista|título>")
         return
+
+    query = " ".join(args).strip()
     try:
-        tr = search_track(q, MARKET)
-        if not tr:
-            await update.message.reply_text("❌ No encontré esa canción en Spotify.")
+        # 1) Si viene link, eliminamos directo
+        link_id = extract_track_id_from_url(query)
+        playlist = get_playlist_items(limit=500)
+        if link_id:
+            t = find_in_playlist_by_id(link_id, playlist)
+            if not t:
+                await update.message.reply_text("⚠️ Esa canción no está en la playlist.")
+                return
+            uri = f"spotify:track:{link_id}"
+            remove_track_from_playlist_by_uri(uri)
+            await update.message.reply_text(f"🗑️ Eliminada: {fmt_track(t)}")
             return
-        tid = tr["id"]
-        if not track_in_playlist(tid):
-            await update.message.reply_text("⚠️ Esa canción no está en la playlist.")
+
+        # 2) Si vino texto, buscamos candidato y validamos contra playlist
+        candidate = best_search_candidate(query, MARKET)
+        if candidate:
+            cand_id = candidate["id"]
+            t = find_in_playlist_by_id(cand_id, playlist)
+            if t:
+                remove_track_from_playlist_by_uri(f"spotify:track:{cand_id}")
+                await update.message.reply_text(f"🗑️ Eliminada: {fmt_track(t)}")
+                return
+
+        # 3) Si no está la del buscador, probamos fuzzy dentro de la playlist
+        best, score = best_playlist_match(query, playlist)
+        if best and score >= 0.60:
+            remove_track_from_playlist_by_uri(f"spotify:track:{best['id']}")
+            await update.message.reply_text(f"🗑️ Eliminada (coincidencia ~{int(score*100)}%): {fmt_track(best)}")
             return
-        remove_from_playlist(tid)
-        name = tr["name"]
-        artists = ", ".join(a["name"] for a in tr["artists"])
-        link = tr["external_urls"]["spotify"]
-        await update.message.reply_text(f"🗑️ Eliminada: *{name}* — {artists}\n🔗 {link}", parse_mode="Markdown")
+
+        # 4) Sugerencias (Top 3 similares) si nada claro
+        suggestions = sorted(
+            [(sim(query, fmt_track(t)), t) for t in playlist],
+            key=lambda x: x[0], reverse=True
+        )[:3]
+        msg = "❌ No encontré una coincidencia clara para eliminar.\n"
+        if suggestions and suggestions[0][0] > 0.35:
+            msg += "Quizá te referías a:\n"
+            for s, t in suggestions:
+                msg += f"• {fmt_track(t)} (≈{int(s*100)}%)\n"
+            msg += "\nPrueba con *Título - Artista* o pega el *link* de la canción."
+        else:
+            msg += "Prueba con *Título - Artista* o pega el *link* de la canción."
+        await update.message.reply_markdown(msg)
+
     except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", "?")
-        await update.message.reply_text(f"⚠️ Error HTTP con Spotify: {code}")
+        log.exception("HTTPError en /remove")
+        await update.message.reply_text(f"❌ Error con Spotify: {e.response.status_code}")
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {e}")
+        log.exception("Error en /remove")
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
-        return
+    # Agregar canciones escribiendo el nombre o pegando el link
+    text = update.message.text.strip()
     try:
-        tr = search_track(text, MARKET)
-        if not tr:
-            await update.message.reply_text("❌ No encontré esa canción. Intenta con *Título - Artista* o pega el *link* de Spotify.", parse_mode="Markdown")
-            return
+        # Si pegó link, extraemos id directo
+        track_id = extract_track_id_from_url(text)
+        if not track_id:
+            # Buscar mejor candidato por texto
+            track = best_search_candidate(text, MARKET)
+            if not track:
+                await update.message.reply_text(
+                    "❌ No encontré un match claro.\nPrueba con *Título - Artista* o pega el *link* de la canción.",
+                    parse_mode="Markdown"
+                )
+                return
+            track_id = track["id"]
+            label = fmt_track(track)
+        else:
+            # Si traía link, armamos label con una consulta ligera para avisar bonito
+            sr = search_tracks(f"track:{track_id}", MARKET, limit=1)
+            label = fmt_track(sr[0]) if sr else "canción"
 
-        tid = tr["id"]
-        name = tr["name"]
-        artists = ", ".join(a["name"] for a in tr["artists"])
-        link = tr["external_urls"]["spotify"]
-
-        if track_in_playlist(tid):
-            await update.message.reply_text(f"🔁 Ya estaba en la playlist: *{name}* — {artists}\n🔗 {link}", parse_mode="Markdown")
-            return
-
-        add_to_playlist(tid)
-        await update.message.reply_text(f"✅ Agregada: *{name}* — {artists}\n🔗 {link}", parse_mode="Markdown")
-
+        add_track_to_playlist(track_id)
+        url = f"https://open.spotify.com/track/{track_id}"
+        await update.message.reply_text(f"✅ Agregada: {label}\n🔗 {url}")
     except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", "?")
-        log.error("HTTPError", exc_info=True)
-        await update.message.reply_text(f"⚠️ Error HTTP con Spotify: {code}")
+        log.exception("HTTPError al agregar")
+        await update.message.reply_text(f"❌ Error con Spotify: {e.response.status_code}")
     except Exception as e:
-        log.exception("Error general")
-        await update.message.reply_text(f"⚠️ Error: {e}")
+        log.exception("Error al agregar")
+        await update.message.reply_text(f"❌ Error: {e}")
 
-def main():
-    required = [
-        ("TELEGRAM_BOT_TOKEN", BOT_TOKEN),
-        ("SPOTIFY_CLIENT_ID", CLIENT_ID),
-        ("SPOTIFY_CLIENT_SECRET", CLIENT_SECRET),
-        ("SPOTIFY_REFRESH_TOKEN", REFRESH_TOKEN),
-        ("SPOTIFY_PLAYLIST_ID", SPOTIFY_PLAYLIST_ID),
-    ]
-    missing = [k for k, v in required if not v]
-    if missing:
-        raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
+def main() -> None:
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("remove", cmd_remove))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    log.info("Bot corriendo… ve a Telegram y prueba tu bot.")
+    log.info("Bot corriendo…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
+    # Si corres local, usa las env de tu .env (opcional si ya las tienes en Render)
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
     main()
